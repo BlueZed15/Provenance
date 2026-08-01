@@ -1,0 +1,25 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+note.txt
+
+# Local documentation and notes
+*.md
+
+# Logs, temporary files, and local editor state
+*.log
+*.tmp
+*.bak
+*.swp
+.coverage
+htmlcov/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
