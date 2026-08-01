@@ -1,4 +1,8 @@
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+import { createProvenanceApi } from "./api.js";
+
+const DEFAULT_ISSUE_KEY = import.meta.env.VITE_DEFAULT_ISSUE_KEY || "ROAD-42";
 
 const VERDICT_CONTENT = {
   drift: {
@@ -11,12 +15,38 @@ const VERDICT_CONTENT = {
     icon: "danger",
   },
   "no-evidence": {
-    badgeText: "UNRESOLVED",
+    badgeText: "NO EVIDENCE",
     badgeClass: "warning",
     messageClass: "sm-warning",
     title: "No linked evidence found",
     rationale:
       "There are no upstream tickets or PRDs mapping to this feature. Please record your strategic reasoning.",
+    icon: "warning",
+  },
+  unresolved: {
+    badgeText: "UNRESOLVED",
+    badgeClass: "warning",
+    messageClass: "sm-warning",
+    title: "Evidence chain unresolved",
+    rationale:
+      "Several plausible upstream evidence chains remain. A human should confirm the intended source.",
+    icon: "warning",
+  },
+  pending: {
+    badgeText: "NOT ANALYSED",
+    badgeClass: "default",
+    messageClass: "sm-neutral",
+    title: "Ready to analyse",
+    rationale:
+      "This Jira decision is connected, but no Decision Integrity Report exists yet.",
+    icon: "warning",
+  },
+  loading: {
+    badgeText: "CONNECTING",
+    badgeClass: "default",
+    messageClass: "sm-neutral",
+    title: "Loading live provenance",
+    rationale: "Connecting to FastAPI and resolving the selected Jira decision.",
     icon: "warning",
   },
   aligned: {
@@ -29,6 +59,92 @@ const VERDICT_CONTENT = {
     icon: "success",
   },
 };
+
+const BACKEND_VERDICTS = {
+  ALIGNED: "aligned",
+  DRIFT: "drift",
+  NO_EVIDENCE: "no-evidence",
+  UNRESOLVED: "unresolved",
+};
+
+const LAYER_RANK = {
+  ROADMAP: 4,
+  PRD: 3,
+  THEME_SUMMARY: 2,
+  RAW_TICKET: 1,
+};
+
+function verdictKey(report) {
+  return BACKEND_VERDICTS[report?.verdict] || "unresolved";
+}
+
+function artifactTitle(artifact) {
+  return (
+    artifact?.metadata?.summary ||
+    artifact?.metadata?.title ||
+    artifact?.external_id ||
+    "Untitled artifact"
+  );
+}
+
+function sourcePresentation(artifact) {
+  if (artifact.source_tool === "JIRA") {
+    return { className: "jira", label: "Jira decision" };
+  }
+  if (artifact.source_tool === "JSM") {
+    return { className: "jsm", label: "JSM ticket" };
+  }
+  if (artifact.source_tool === "CONFLUENCE") {
+    return {
+      className: "conf",
+      label: artifact.layer === "PRD" ? "Confluence PRD" : "Confluence theme",
+    };
+  }
+  return { className: "conf", label: artifact.source_tool || "Source" };
+}
+
+function formatTimestamp(value) {
+  if (!value) return "Date unknown";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "Date unknown";
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(parsed);
+}
+
+function buildTrace(report, artifacts) {
+  const outgoing = new Map();
+  for (const edge of report.edges || []) {
+    const siblings = outgoing.get(edge.from_version_id) || [];
+    siblings.push(edge);
+    outgoing.set(edge.from_version_id, siblings);
+  }
+  for (const siblings of outgoing.values()) {
+    siblings.sort((left, right) => {
+      const observed = Number(right.status === "OBSERVED") - Number(left.status === "OBSERVED");
+      if (observed) return observed;
+      const leftRank = LAYER_RANK[artifacts[left.to_version_id]?.layer] || 0;
+      const rightRank = LAYER_RANK[artifacts[right.to_version_id]?.layer] || 0;
+      return rightRank - leftRank;
+    });
+  }
+
+  const trace = [];
+  const visited = new Set();
+  function visit(versionId, incomingEdge = null) {
+    if (visited.has(versionId)) return;
+    visited.add(versionId);
+    const artifact = artifacts[versionId];
+    if (artifact) trace.push({ artifact, incomingEdge });
+    for (const edge of outgoing.get(versionId) || []) {
+      visit(edge.to_version_id, edge);
+    }
+  }
+  visit(report.decision_version_id);
+  return trace;
+}
 
 function JiraLogoIcon() {
   return (
@@ -282,16 +398,26 @@ function ProjectSidebar() {
   );
 }
 
-function IssueWorkspace() {
+function IssueWorkspace({ dashboard, live }) {
+  const artifact = live ? dashboard?.artifact : null;
+  const decision = live ? dashboard?.decision : null;
+  const metadata = artifact?.metadata || {};
+  const issueKey = decision?.external_id || "PROJ-882";
+  const title = decision?.title || "Redesign Checkout Page";
+  const description =
+    artifact?.text ||
+    "We are prioritizing a massive overhaul of the checkout flow for Q3. As part of this redesign, the core objective is to reduce enterprise billing friction.\n\nRequirements:\n- Implement a new responsive billing matrix.\n- Add a bulk export button for enterprise invoices.\n- Simplify the credit card entry form.";
+  const status = metadata.status || "IN PROGRESS";
+
   return (
     <main className="issue-workspace">
       <div className="breadcrumbs">
         <a href="#projects">Projects</a> <span>/</span>{" "}
         <a href="#frontend-platform">Frontend Platform</a> <span>/</span>{" "}
-        <span>PROJ-882</span>
+        <span>{issueKey}</span>
       </div>
 
-      <h1 className="issue-title">Redesign Checkout Page</h1>
+      <h1 className="issue-title">{title}</h1>
 
       <div className="issue-action-bar">
         <button type="button" className="atl-button-secondary">
@@ -312,17 +438,7 @@ function IssueWorkspace() {
         <div>
           <div className="field-group">
             <h4>Description</h4>
-            <p className="field-value">
-              We are prioritizing a massive overhaul of the checkout flow for Q3. As
-              part of this redesign, the core objective is to reduce enterprise billing
-              friction.
-              <br />
-              <br />
-              <strong>Requirements:</strong>
-              <br />- Implement a new responsive billing matrix.
-              <br />- Add a <strong>bulk export button</strong> for enterprise invoices.
-              <br />- Simplify the credit card entry form.
-            </p>
+            <p className="field-value issue-description">{description}</p>
           </div>
 
           <div className="field-group activity-section">
@@ -345,7 +461,7 @@ function IssueWorkspace() {
           <div className="field-group">
             <h4>Status</h4>
             <p>
-              <span className="lozenge inprogress">IN PROGRESS</span>
+              <span className="lozenge inprogress">{status}</span>
             </p>
           </div>
           <div className="field-group">
@@ -364,7 +480,9 @@ function IssueWorkspace() {
           </div>
           <div className="field-group">
             <h4>Labels</h4>
-            <p className="labels-empty">None</p>
+            <p className="labels-empty">
+              {metadata.labels?.length ? metadata.labels.join(", ") : "None"}
+            </p>
           </div>
         </div>
       </div>
@@ -491,8 +609,131 @@ function AlignedState() {
   );
 }
 
-function ProvenanceSidebar({ verdict }) {
-  const content = VERDICT_CONTENT[verdict];
+function LiveReportState({ dashboard }) {
+  const { report, artifacts } = dashboard;
+  const trace = buildTrace(report, artifacts);
+  const transformsByEdge = new Map();
+  for (const transform of report.transforms || []) {
+    const existing = transformsByEdge.get(transform.edge_id) || [];
+    existing.push(transform);
+    transformsByEdge.set(transform.edge_id, existing);
+  }
+
+  if (trace.length === 0) {
+    return (
+      <div className="empty-live-state">
+        The report is current, but its artifact versions could not be rendered.
+      </div>
+    );
+  }
+
+  return (
+    <div className="state-view active">
+      {report.verification_status !== "CURRENT" && (
+        <div className="verification-banner">
+          {report.verification_status === "VERIFYING"
+            ? "New evidence is being verified. This is the previous report."
+            : "New evidence exists. Reverify before relying on this report."}
+        </div>
+      )}
+
+      <div className="timeline">
+        {trace.map(({ artifact, incomingEdge }) => {
+          const source = sourcePresentation(artifact);
+          const edgeTransforms = incomingEdge
+            ? transformsByEdge.get(incomingEdge.id) || []
+            : [];
+          const emphasized =
+            edgeTransforms.find((item) => item.id === report.max_drift_transform_id) ||
+            edgeTransforms.find((item) => item.is_critical) ||
+            edgeTransforms[0];
+          const quote = (report.source_quotes || []).find(
+            (item) => item.version_id === artifact.id,
+          );
+          const excerpt = quote?.source_span || artifact.text;
+          const positive = ["PRESERVED", "LEGITIMATE_GENERALIZATION"].includes(
+            emphasized?.transform_type,
+          );
+
+          return (
+            <div className={`node ${source.className}`} key={artifact.id}>
+              {incomingEdge && (
+                <div className="edge-badge-container">
+                  <span className="lozenge default">
+                    {incomingEdge.confidence || incomingEdge.status}
+                  </span>
+                </div>
+              )}
+              <div className="node-meta">
+                <span className={`app-label ${source.className}`}>{source.label}</span>
+                <span>
+                  {formatTimestamp(
+                    artifact.source_updated_at || artifact.source_created_at,
+                  )}
+                </span>
+              </div>
+              <h4 className="node-title">
+                {artifact.external_url ? (
+                  <a href={artifact.external_url} target="_blank" rel="noreferrer">
+                    {artifactTitle(artifact)}
+                  </a>
+                ) : (
+                  artifactTitle(artifact)
+                )}
+              </h4>
+              {excerpt && (
+                <QuoteBlock
+                  snippet={`“${excerpt.slice(0, 86)}${excerpt.length > 86 ? "…" : ""}”`}
+                  expandable={excerpt.length > 86}
+                >
+                  {excerpt}
+                </QuoteBlock>
+              )}
+              {emphasized && (
+                <div className={positive ? "local-success" : "local-drift"}>
+                  <strong>{emphasized.transform_type}</strong>
+                  {emphasized.rationale}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="report-footer">
+        <span>{report.analysis_mode} evidence</span>
+        <span>{formatTimestamp(report.generated_at)}</span>
+      </div>
+    </div>
+  );
+}
+
+function ProvenanceSidebar({
+  dashboard,
+  demoVerdict,
+  viewMode,
+  loading,
+  job,
+  onAnalyse,
+}) {
+  const isLive = viewMode === "live";
+  const report = isLive ? dashboard?.report : null;
+  const verdict = report ? verdictKey(report) : demoVerdict;
+  const content = loading
+    ? VERDICT_CONTENT.loading
+    : report
+      ? {
+          ...VERDICT_CONTENT[verdict],
+          badgeText: report.verdict.replaceAll("_", " "),
+          title: report.headline,
+          rationale:
+            report.transforms?.find(
+              (item) => item.id === report.max_drift_transform_id,
+            )?.rationale || VERDICT_CONTENT[verdict].rationale,
+        }
+      : isLive && dashboard
+        ? VERDICT_CONTENT.pending
+        : VERDICT_CONTENT[demoVerdict];
 
   return (
     <aside className="prov-sidebar">
@@ -513,45 +754,187 @@ function ProvenanceSidebar({ verdict }) {
           <p className="hero-rationale">{content.rationale}</p>
         </div>
 
-        {verdict === "drift" && <DriftState />}
-        {verdict === "no-evidence" && <NoEvidenceState />}
-        {verdict === "aligned" && <AlignedState />}
+        {job && (
+          <div className="job-progress" role="status">
+            <div>
+              <span>{job.stage?.replaceAll("_", " ") || "ANALYSING"}</span>
+              <strong>{job.progress || 0}%</strong>
+            </div>
+            <progress max="100" value={job.progress || 0} />
+          </div>
+        )}
+
+        {report && <LiveReportState dashboard={dashboard} />}
+        {!report && isLive && dashboard && (
+          <div className="empty-live-state">
+            <p>No report has been generated for {dashboard.decision.external_id}.</p>
+            <button
+              type="button"
+              className="atl-button-primary"
+              onClick={onAnalyse}
+              disabled={Boolean(job)}
+            >
+              {dashboard.provenance.active_job_id ? "Resume analysis" : "Analyse decision"}
+            </button>
+          </div>
+        )}
+        {!isLive && demoVerdict === "drift" && <DriftState />}
+        {!isLive && demoVerdict === "no-evidence" && <NoEvidenceState />}
+        {!isLive && demoVerdict === "aligned" && <AlignedState />}
       </div>
     </aside>
   );
 }
 
-function HackathonConsole({ setVerdict }) {
+function HackathonConsole({
+  apiState,
+  dashboard,
+  demoVerdict,
+  error,
+  job,
+  onAnalyse,
+  onRefresh,
+  onReverify,
+  setDemoVerdict,
+  setViewMode,
+  viewMode,
+}) {
+  const showDemo = (nextVerdict) => {
+    setDemoVerdict(nextVerdict);
+    setViewMode("demo");
+  };
+
   return (
     <div className="demo-console">
-      <h4>Hackathon Console</h4>
+      <div className="console-heading">
+        <h4>Hackathon Console</h4>
+        <span className={`api-status ${apiState}`}>{apiState}</span>
+      </div>
+      {error && (
+        <p className="console-error" title={error}>
+          {error}
+        </p>
+      )}
       <button
         type="button"
-        className="demo-btn"
-        onClick={() => setVerdict("aligned")}
+        className={`demo-btn${viewMode === "live" ? " selected" : ""}`}
+        onClick={onRefresh}
+        disabled={apiState === "loading" || apiState === "running"}
       >
-        🟢 Simulate Aligned
+        ↻ Load live API
+      </button>
+      {dashboard && !dashboard.report && (
+        <button
+          type="button"
+          className="demo-btn action"
+          onClick={onAnalyse}
+          disabled={Boolean(job)}
+        >
+          {job ? `Analysing · ${job.progress || 0}%` : "▶ Analyse with Mistral"}
+        </button>
+      )}
+      {dashboard?.report && (
+        <button
+          type="button"
+          className="demo-btn action"
+          onClick={onReverify}
+          disabled={Boolean(job)}
+        >
+          {job ? `Verifying · ${job.progress || 0}%` : "✓ Reverify evidence"}
+        </button>
+      )}
+      <div className="console-divider">Presentation fallback</div>
+      <button
+        type="button"
+        className={`demo-btn${viewMode === "demo" && demoVerdict === "aligned" ? " selected" : ""}`}
+        onClick={() => showDemo("aligned")}
+      >
+        🟢 Demo Aligned
       </button>
       <button
         type="button"
-        className="demo-btn"
-        onClick={() => setVerdict("drift")}
+        className={`demo-btn${viewMode === "demo" && demoVerdict === "drift" ? " selected" : ""}`}
+        onClick={() => showDemo("drift")}
       >
-        🔴 Simulate Drift
+        🔴 Demo Drift
       </button>
       <button
         type="button"
-        className="demo-btn"
-        onClick={() => setVerdict("no-evidence")}
+        className={`demo-btn${viewMode === "demo" && demoVerdict === "no-evidence" ? " selected" : ""}`}
+        onClick={() => showDemo("no-evidence")}
       >
-        🟡 Simulate No Evidence
+        🟡 Demo No Evidence
       </button>
     </div>
   );
 }
 
 export default function App() {
-  const [verdict, setVerdict] = useState("drift");
+  const api = useMemo(() => createProvenanceApi(), []);
+  const [apiState, setApiState] = useState("loading");
+  const [dashboard, setDashboard] = useState(null);
+  const [demoVerdict, setDemoVerdict] = useState("drift");
+  const [error, setError] = useState("");
+  const [job, setJob] = useState(null);
+  const [viewMode, setViewMode] = useState("live");
+
+  const loadDashboard = useCallback(async () => {
+    setApiState("loading");
+    setError("");
+    try {
+      const nextDashboard = await api.loadDashboard(DEFAULT_ISSUE_KEY);
+      setDashboard(nextDashboard);
+      setViewMode("live");
+      setApiState("live");
+      return nextDashboard;
+    } catch (loadError) {
+      setApiState("offline");
+      setError(loadError.message);
+      setViewMode("demo");
+      return null;
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void loadDashboard();
+  }, [loadDashboard]);
+
+  const runJob = useCallback(
+    async (operation) => {
+      if (!dashboard) return;
+      setApiState("running");
+      setError("");
+      try {
+        await operation((nextJob) => setJob(nextJob));
+        setJob(null);
+        await loadDashboard();
+      } catch (jobError) {
+        setJob(null);
+        setApiState("offline");
+        setError(jobError.message);
+      }
+    },
+    [dashboard, loadDashboard],
+  );
+
+  const analyse = useCallback(() => {
+    if (!dashboard) return;
+    const activeJobId = dashboard.provenance.active_job_id;
+    void runJob((onProgress) =>
+      activeJobId
+        ? api.waitForJob(activeJobId, onProgress)
+        : api.analyzeDecision(dashboard.decision.id, onProgress),
+    );
+  }, [api, dashboard, runJob]);
+
+  const reverify = useCallback(() => {
+    if (!dashboard) return;
+    void runJob((onProgress) =>
+      api.reverifyDecision(dashboard.decision.id, onProgress),
+    );
+  }, [api, dashboard, runJob]);
+
+  const liveIssue = viewMode === "live" && Boolean(dashboard);
 
   return (
     <div className="provenance-page">
@@ -559,10 +942,29 @@ export default function App() {
       <JiraTopNav />
       <div className="app-container">
         <ProjectSidebar />
-        <IssueWorkspace />
-        <ProvenanceSidebar verdict={verdict} />
+        <IssueWorkspace dashboard={dashboard} live={liveIssue} />
+        <ProvenanceSidebar
+          dashboard={dashboard}
+          demoVerdict={demoVerdict}
+          viewMode={viewMode}
+          loading={apiState === "loading"}
+          job={job}
+          onAnalyse={analyse}
+        />
       </div>
-      <HackathonConsole setVerdict={setVerdict} />
+      <HackathonConsole
+        apiState={apiState}
+        dashboard={dashboard}
+        demoVerdict={demoVerdict}
+        error={error}
+        job={job}
+        onAnalyse={analyse}
+        onRefresh={() => void loadDashboard()}
+        onReverify={reverify}
+        setDemoVerdict={setDemoVerdict}
+        setViewMode={setViewMode}
+        viewMode={viewMode}
+      />
     </div>
   );
 }
@@ -838,6 +1240,10 @@ const styles = `
     color: var(--color-text);
   }
 
+  .issue-description {
+    white-space: pre-line;
+  }
+
   .activity-section {
     margin-top: 40px;
     border-top: 1px solid var(--color-border);
@@ -997,6 +1403,10 @@ const styles = `
     background-color: var(--loz-success-bg);
   }
 
+  .sm-neutral {
+    background-color: var(--color-bg-sunken);
+  }
+
   .sm-title {
     font-weight: 600;
     display: flex;
@@ -1090,6 +1500,15 @@ const styles = `
     font-size: 14px;
     font-weight: 500;
     margin: 0 0 12px;
+  }
+
+  .node-title a {
+    color: var(--color-link);
+    text-decoration: none;
+  }
+
+  .node-title a:hover {
+    text-decoration: underline;
   }
 
   .quote-block {
@@ -1188,7 +1607,68 @@ const styles = `
     gap: 8px;
   }
 
-  /* Floating Hackathon Demo Console — kept visually unchanged. */
+  .verification-banner,
+  .empty-live-state {
+    background: var(--loz-warning-bg);
+    color: var(--loz-warning-text);
+    border-radius: 3px;
+    padding: 12px;
+    margin-bottom: 20px;
+    line-height: 1.45;
+  }
+
+  .empty-live-state p {
+    margin: 0 0 12px;
+  }
+
+  .atl-button-primary {
+    background: var(--jira-blue);
+    border: none;
+    border-radius: 3px;
+    color: white;
+    cursor: pointer;
+    font-weight: 600;
+    padding: 8px 12px;
+  }
+
+  .atl-button-primary:disabled {
+    cursor: wait;
+    opacity: 0.6;
+  }
+
+  .job-progress {
+    background: var(--color-bg-sunken);
+    border-radius: 3px;
+    margin-bottom: 20px;
+    padding: 12px;
+  }
+
+  .job-progress div,
+  .report-footer {
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .job-progress div {
+    font-size: 11px;
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+
+  .job-progress progress {
+    accent-color: var(--jira-blue);
+    width: 100%;
+  }
+
+  .report-footer {
+    border-top: 1px solid var(--color-border);
+    color: var(--color-text-subtle);
+    font-size: 11px;
+    padding-top: 12px;
+    text-transform: capitalize;
+  }
+
+  /* Floating controls keep the demo usable if live credentials fail at showtime. */
   .demo-console {
     position: fixed;
     bottom: 24px;
@@ -1199,7 +1679,13 @@ const styles = `
     border-radius: 6px;
     box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
     z-index: 1000;
-    width: 220px;
+    width: 240px;
+  }
+
+  .console-heading {
+    align-items: center;
+    display: flex;
+    justify-content: space-between;
   }
 
   .demo-console h4 {
@@ -1208,6 +1694,49 @@ const styles = `
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: #8993A4;
+  }
+
+  .api-status {
+    border-radius: 999px;
+    font-size: 9px;
+    font-weight: 800;
+    padding: 3px 7px;
+    text-transform: uppercase;
+  }
+
+  .api-status.live {
+    background: #BAF3DB;
+    color: #164B35;
+  }
+
+  .api-status.loading,
+  .api-status.running {
+    background: #CCE0FF;
+    color: #09326C;
+  }
+
+  .api-status.offline {
+    background: #FFD2CC;
+    color: #5D1F1A;
+  }
+
+  .console-error {
+    color: #FFB8B0;
+    display: -webkit-box;
+    font-size: 11px;
+    line-height: 1.35;
+    margin: 0 0 10px;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
+  .console-divider {
+    color: #8993A4;
+    font-size: 10px;
+    letter-spacing: 0.3px;
+    margin: 12px 0 8px;
+    text-transform: uppercase;
   }
 
   .demo-btn {
@@ -1226,6 +1755,21 @@ const styles = `
 
   .demo-btn:hover {
     background: rgba(255, 255, 255, 0.2);
+  }
+
+  .demo-btn.selected {
+    border-color: #85B8FF;
+    background: rgba(87, 157, 255, 0.25);
+  }
+
+  .demo-btn.action {
+    border-color: #7EE2B8;
+    color: #BAF3DB;
+  }
+
+  .demo-btn:disabled {
+    cursor: wait;
+    opacity: 0.55;
   }
 
   @media (max-width: 1100px) {
